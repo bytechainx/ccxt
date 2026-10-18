@@ -19,6 +19,8 @@
 #![allow(dead_code)]
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::{SinkExt, StreamExt};
@@ -42,8 +44,35 @@ pub struct ClientState {
     /// Serializes the (async) connect so concurrent `ensure_client`s for a
     /// pre-registered slot don't open two sockets.
     connect_gate: tokio::sync::Mutex<()>,
+    /// Optional pre-parse frame observer.
+    ///
+    /// Called by the reader task with the **complete frame bytes** and a
+    /// monotonic timestamp sampled **before** the frame enters `incoming`.
+    /// Downstream consumers use it to archive raw frames and to take number
+    /// lexemes from the original text instead of the `f64`-normalised `Value`.
+    ///
+    /// `None` (the default) keeps behaviour byte-for-byte identical to before.
+    raw_frame_hook: Mutex<Option<RawFrameHook>>,
     /// Parsed inbound messages awaiting dispatch to `handle_message`.
+    ///
+    /// Bounded: `incoming_capacity` frames (G4/A03). A push past the bound
+    /// fails the connection closed instead of growing without limit; the drop
+    /// is counted in `incoming_overflow` and reported through the event hook.
     incoming: Mutex<VecDeque<Value>>,
+    /// Hard frame-count bound on `incoming`. `0` disables the bound.
+    incoming_capacity: AtomicUsize,
+    /// Frames rejected by the bound since this slot was created.
+    incoming_overflow: AtomicU64,
+    /// Monotonic counter of **physical** connections opened for this URL
+    /// (G2/A02/A07). A reconnect opens a new physical socket and therefore
+    /// gets a higher value than the closed slot it replaced; a reused live
+    /// socket keeps the old one. `drop_client` forgets the URL and restarts
+    /// the count, so a coordinator that tracks epochs must keep the slot.
+    generation: AtomicU64,
+    /// Optional connection-lifecycle observer (G2).
+    event_hook: Mutex<Option<WsEventHook>>,
+    /// Why the slot closed; `None` while open.
+    close_reason: Mutex<Option<String>>,
     /// Woken on: new inbound message, a resolve/reject, or close.
     notify: Notify,
     /// messageHash → resolved value (set by `handle_message` via `resolve`).
@@ -97,6 +126,89 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// A complete inbound frame **before** parsing.
+///
+/// Held by the reader task between `read.next()` and `parse_text` /
+/// `parse_binary`, which is the only place the original bytes exist.
+#[derive(Debug, Clone)]
+pub enum RawFrame {
+    /// A WebSocket text frame.
+    Text(String),
+    /// A WebSocket binary frame (may be gzip/deflate encoded).
+    Binary(Vec<u8>),
+}
+
+impl RawFrame {
+    /// The frame bytes as they arrived on the wire (not decompressed).
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            RawFrame::Text(t) => t.as_bytes(),
+            RawFrame::Binary(b) => b,
+        }
+    }
+}
+
+/// Borrowed view of a frame, used on the reader hot path so that no owned
+/// [`RawFrame`] is built when no observer is installed.
+#[derive(Debug, Clone, Copy)]
+pub enum RawFrameRef<'a> {
+    /// A WebSocket text frame.
+    Text(&'a str),
+    /// A WebSocket binary frame.
+    Binary(&'a [u8]),
+}
+
+impl<'a> RawFrameRef<'a> {
+    /// The frame bytes as they arrived on the wire (not decompressed).
+    pub fn bytes(&self) -> &'a [u8] {
+        match self {
+            RawFrameRef::Text(t) => t.as_bytes(),
+            RawFrameRef::Binary(b) => b,
+        }
+    }
+
+    /// Materialise an owned frame. Only called when a hook is installed.
+    pub fn into_owned(self) -> RawFrame {
+        match self {
+            RawFrameRef::Text(t) => RawFrame::Text(t.to_string()),
+            RawFrameRef::Binary(b) => RawFrame::Binary(b.to_vec()),
+        }
+    }
+}
+
+/// Pre-parse frame observer: receives the frame and its arrival instant.
+///
+/// `Instant` is sampled at the call site in the reader task, i.e. before
+/// parsing and before the frame is enqueued, so it can serve as `received_at`.
+pub type RawFrameHook = std::sync::Arc<dyn Fn(RawFrame, Instant) + Send + Sync>;
+
+/// Default hard bound on the pre-dispatch inbound queue (G4/A03).
+///
+/// Sized for burst tolerance, not for throughput: a consumer that cannot drain
+/// this many parsed frames is not keeping up, and letting the queue grow turns
+/// a visible overload into an invisible memory leak.
+pub const DEFAULT_INCOMING_CAPACITY: usize = 8192;
+
+/// One connection-lifecycle event (G2/A02/A07).
+///
+/// `generation` identifies the **physical** connection. It increases by exactly
+/// one per successful connect, so a consumer can attach every open/close to the
+/// socket it belongs to instead of inferring it from wall-clock proximity.
+#[derive(Debug, Clone)]
+pub enum WsEvent {
+    /// A socket was opened; `generation` is unique for this slot.
+    Opened { generation: u64 },
+    /// A socket ended (peer close, read error, or a local failure).
+    Closed { generation: u64, reason: String },
+    /// The inbound queue hit its hard bound; the connection was failed closed.
+    Overflow { generation: u64, dropped: u64, capacity: usize },
+}
+
+/// Connection-lifecycle observer. Runs on the task that observed the event;
+/// keep it cheap and non-blocking (it holds no lock, but it is on the reader
+/// path for `Overflow`).
+pub type WsEventHook = std::sync::Arc<dyn Fn(WsEvent) + Send + Sync>;
+
 /// Decode a text frame into a `Value` — JSON when it parses, else a raw string
 /// (some venues send bare `"pong"` etc. that `handle_message` matches on).
 fn parse_text(t: &str) -> Value {
@@ -148,9 +260,133 @@ fn parse_raw_binary(b: &[u8]) -> Value {
 }
 
 impl ClientState {
-    fn push_incoming(&self, v: Value) {
-        self.incoming.lock().unwrap().push_back(v);
+    /// Enqueue a parsed frame. Returns `false` when the frame was **not**
+    /// queued because the connection is closing or the queue hit its bound.
+    ///
+    /// Callers on the reader path must stop reading on `false`: the slot is
+    /// already failed closed, and continuing would only burn CPU on a socket
+    /// nobody is allowed to observe.
+    fn push_incoming(&self, v: Value) -> bool {
+        if *self.closed.lock().unwrap() {
+            return false;
+        }
+        let capacity = self.incoming_capacity.load(Ordering::SeqCst);
+        let mut q = self.incoming.lock().unwrap();
+        if capacity != 0 && q.len() >= capacity {
+            drop(q);
+            self.overflow(capacity);
+            return false;
+        }
+        q.push_back(v);
+        drop(q);
         self.notify.notify_waiters();
+        true
+    }
+
+    /// Fail the connection closed because the inbound queue is full.
+    ///
+    /// One `Overflow` event per connection: the closed flag is set before the
+    /// event fires, so later reader frames take the `closed` fast path and do
+    /// not inflate the counter.
+    fn overflow(&self, capacity: usize) {
+        let dropped = self.incoming_overflow.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = self.generation.load(Ordering::SeqCst);
+        let first = self.mark_closed("incoming queue overflow");
+        if first {
+            self.emit(WsEvent::Overflow { generation, dropped, capacity });
+        }
+    }
+
+    /// Set (or clear, with `None`) the connection-lifecycle observer.
+    pub fn set_event_hook(&self, hook: Option<WsEventHook>) {
+        *self.event_hook.lock().unwrap() = hook;
+    }
+
+    /// Generation of the current (or last) physical connection. `0` means this
+    /// slot never opened a socket.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Frames rejected by the hard bound since this slot was created.
+    pub fn overflow_count(&self) -> u64 {
+        self.incoming_overflow.load(Ordering::SeqCst)
+    }
+
+    /// Why the slot closed; `None` while it is open.
+    pub fn close_reason(&self) -> Option<String> {
+        self.close_reason.lock().unwrap().clone()
+    }
+
+    /// Install or change the hard queue bound. `0` disables it (test/debug
+    /// only — production profiles must keep a finite bound).
+    pub fn set_incoming_capacity(&self, capacity: usize) {
+        let queued = self.incoming.lock().unwrap().len();
+        // Shrinking below the current backlog is refused rather than silently
+        // truncating frames that a consumer has not seen yet.
+        if capacity != 0 && capacity < queued {
+            return;
+        }
+        self.incoming_capacity.store(capacity, Ordering::SeqCst);
+    }
+
+    /// Mark the slot closed exactly once, recording the reason and emitting
+    /// `Closed`. Returns `true` for the transition that actually closed it.
+    fn mark_closed(&self, reason: &str) -> bool {
+        let first = {
+            let mut closed = self.closed.lock().unwrap();
+            if *closed {
+                false
+            } else {
+                *closed = true;
+                true
+            }
+        };
+        *self.connected.lock().unwrap() = false;
+        if first {
+            *self.close_reason.lock().unwrap() = Some(reason.to_string());
+        }
+        self.notify.notify_waiters();
+        if first {
+            self.emit(WsEvent::Closed {
+                generation: self.generation.load(Ordering::SeqCst),
+                reason: reason.to_string(),
+            });
+        }
+        first
+    }
+
+    /// Invoke the lifecycle observer, if one is installed, outside any lock.
+    fn emit(&self, event: WsEvent) {
+        let hook = self.event_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(event);
+        }
+    }
+
+    /// Install (or clear, with `None`) the pre-parse frame observer.
+    ///
+    /// The hook runs synchronously on the reader task **before** parsing and
+    /// before the frame is queued, so `received_at` reflects arrival rather
+    /// than dequeue time. Keep the callback cheap: it is in the hot path.
+    pub fn set_raw_frame_hook(&self, hook: Option<RawFrameHook>) {
+        *self.raw_frame_hook.lock().unwrap() = hook;
+    }
+
+    /// Invoke the observer, if one is installed.
+    ///
+    /// Takes the frame **by reference** and only materialises an owned
+    /// [`RawFrame`] when a hook is actually installed. With no hook this is one
+    /// `Option` check and **no `String`/`Vec` clone** — the frame text is still
+    /// borrowed from the reader loop, so the hot path stays allocation-free.
+    ///
+    /// The `Arc` is cloned and the lock released before the call, so a hook
+    /// that (re)installs itself cannot deadlock.
+    fn observe_raw_frame(&self, frame: RawFrameRef<'_>, received_at: Instant) {
+        let hook = self.raw_frame_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(frame.into_owned(), received_at);
+        }
     }
 
     /// Await the next inbound message. `None` once the socket is closed and
@@ -332,11 +568,21 @@ impl ClientState {
     pub fn mock_enable(&self) {
         *self.mock.lock().unwrap() = true;
         *self.connected.lock().unwrap() = true;
+        // The mock transport is socket-less but still a connection for the
+        // purpose of lifecycle observation: consumers exercise the same
+        // generation/closed path in tests as on the wire.
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.emit(WsEvent::Opened { generation });
     }
-    /// Injected inbound frame → the same queue the socket reader feeds.
+
+    /// Close a mock connection (fixture teardown). Real sockets close through
+    /// the reader task; this mirrors that transition without one.
+    pub fn mock_close(&self, reason: &str) {
+        self.mark_closed(reason);
+    }
+    /// Injected inbound frame → the same queue (and bound) the reader feeds.
     pub fn mock_inject(&self, msg: Value) {
-        self.incoming.lock().unwrap().push_back(msg);
-        self.notify.notify_one();
+        let _ = self.push_incoming(msg);
     }
     pub fn is_mock(&self) -> bool { *self.mock.lock().unwrap() }
     /// The captured outgoing frames as a `Value::List`.
@@ -536,7 +782,45 @@ async fn connect_via_proxy(
 }
 
 pub async fn ensure_client(url: &str, proxy: Option<String>, decompress_binary: bool) -> Result<Arc<ClientState>, String> {
-    let state = ensure_slot(url);
+    ensure_client_with_hook(url, proxy, decompress_binary, None).await
+}
+
+/// Like [`ensure_client`], but installs a pre-parse frame observer **before the
+/// socket is opened**.
+///
+/// Use this when the first frame matters. With plain [`ensure_client`] the
+/// caller can only install the hook after the connection is already up, so any
+/// frame that arrives in the meantime is lost — the observer is a live tap, not
+/// a replay buffer.
+///
+/// The hook is applied when the slot is created, which happens before the reader
+/// task is spawned. If a slot for `url` already exists and is still open, it is
+/// reused and the hook is installed on it: that still covers frames from this
+/// point on, but it cannot recover frames that arrived before the call (another
+/// consumer may already own the socket — slots are keyed by URL and shared).
+pub async fn ensure_client_with_hook(
+    url: &str,
+    proxy: Option<String>,
+    decompress_binary: bool,
+    hook: Option<RawFrameHook>,
+) -> Result<Arc<ClientState>, String> {
+    ensure_client_with_hooks(url, proxy, decompress_binary, hook, None).await
+}
+
+/// Like [`ensure_client_with_hook`], but also installs the connection-lifecycle
+/// observer **before** the socket opens, so the `Opened` event of the first
+/// connection is not missed (G2).
+pub async fn ensure_client_with_hooks(
+    url: &str,
+    proxy: Option<String>,
+    decompress_binary: bool,
+    hook: Option<RawFrameHook>,
+    events: Option<WsEventHook>,
+) -> Result<Arc<ClientState>, String> {
+    let state = ensure_slot_with_hook(url, hook);
+    if let Some(events) = events {
+        state.set_event_hook(Some(events));
+    }
     if *state.connected.lock().unwrap() {
         return Ok(state);
     }
@@ -576,8 +860,20 @@ pub async fn ensure_client(url: &str, proxy: Option<String>, decompress_binary: 
     tokio::spawn(async move {
         while let Some(frame) = read.next().await {
             match frame {
-                Ok(Message::Text(t)) => st.push_incoming(parse_text(&t)),
-                Ok(Message::Binary(b)) => st.push_incoming(if decompress_binary { parse_binary(&b) } else { parse_raw_binary(&b) }),
+                Ok(Message::Text(t)) => {
+                    // Sample arrival time BEFORE parsing/queueing (G1).
+                    // Borrowed view: no clone unless a hook is installed.
+                    st.observe_raw_frame(RawFrameRef::Text(&t), Instant::now());
+                    if !st.push_incoming(parse_text(&t)) {
+                        break;
+                    }
+                }
+                Ok(Message::Binary(b)) => {
+                    st.observe_raw_frame(RawFrameRef::Binary(&b), Instant::now());
+                    if !st.push_incoming(if decompress_binary { parse_binary(&b) } else { parse_raw_binary(&b) }) {
+                        break;
+                    }
+                }
                 Ok(Message::Pong(_)) => st.on_pong(),
                 // tungstenite answers Ping frames with Pong automatically.
                 Ok(Message::Ping(_)) => {}
@@ -585,9 +881,9 @@ pub async fn ensure_client(url: &str, proxy: Option<String>, decompress_binary: 
                 _ => {}
             }
         }
-        *st.connected.lock().unwrap() = false;
-        *st.closed.lock().unwrap() = true;
-        st.notify.notify_waiters();
+        // One close transition per connection: a reader that stopped because
+        // of an overflow must not overwrite the reason recorded there.
+        st.mark_closed("socket closed");
     });
 
     // Keep-alive: an unsolicited Ping every 30s; the peer's Pong updates
@@ -607,7 +903,12 @@ pub async fn ensure_client(url: &str, proxy: Option<String>, decompress_binary: 
         }
     });
 
+    // G2: the socket is up. Publish its generation *before* the reader can
+    // dispatch anything, so every frame and close is attributable to exactly
+    // one physical connection.
+    let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
     *state.connected.lock().unwrap() = true;
+    state.emit(WsEvent::Opened { generation });
     Ok(state)
 }
 
@@ -625,10 +926,36 @@ pub fn client_field_live(url: &str, field: &str) -> Value {
 /// Get-or-create the registry slot for `url` WITHOUT connecting the socket, so
 /// `client.subscriptions` written before `watch()` connects still persist.
 fn ensure_slot(url: &str) -> Arc<ClientState> {
+    ensure_slot_with_hook(url, None)
+}
+
+/// Like [`ensure_slot`], but installs `hook` on a **newly created** slot before it
+/// is returned.
+///
+/// Installing here (rather than after `ensure_client` returns) is what makes the
+/// observer safe for the first frame: the reader task is only spawned later,
+/// inside `ensure_client`, so a hook installed at slot creation is guaranteed to
+/// be in place before any frame can arrive.
+///
+/// If the slot already exists it is reused as-is; `hook`, when provided, is
+/// installed on it (see the note on [`ensure_client_with_hook`]).
+fn ensure_slot_with_hook(url: &str, hook: Option<RawFrameHook>) -> Arc<ClientState> {
     let mut reg = REGISTRY.lock().unwrap();
+    // A reconnect after a close creates a fresh slot; carry the generation
+    // forward so epochs stay monotonic for the URL instead of restarting at 1
+    // and making two physical connections indistinguishable (G2/A02).
+    let mut previous_generation = 0;
     if let Some(c) = reg.get(url) {
+        if c.is_closed() {
+            previous_generation = c.generation();
+        }
         if !c.is_closed() {
-            return c.clone();
+            let existing = c.clone();
+            drop(reg);
+            if let Some(hook) = hook {
+                existing.set_raw_frame_hook(Some(hook));
+            }
+            return existing;
         }
     }
     let (tx, rx) = mpsc::unbounded_channel::<Message>();
@@ -637,7 +964,13 @@ fn ensure_slot(url: &str) -> Arc<ClientState> {
         outgoing: tx,
         pending_rx: Mutex::new(Some(rx)),
         connect_gate: tokio::sync::Mutex::new(()),
+        raw_frame_hook: Mutex::new(hook),
         incoming: Mutex::new(VecDeque::new()),
+        incoming_capacity: AtomicUsize::new(DEFAULT_INCOMING_CAPACITY),
+        incoming_overflow: AtomicU64::new(0),
+        generation: AtomicU64::new(previous_generation),
+        event_hook: Mutex::new(None),
+        close_reason: Mutex::new(None),
         notify: Notify::new(),
         resolved: Mutex::new(HashMap::new()),
         rejections: Mutex::new(HashMap::new()),
@@ -1241,5 +1574,90 @@ mod tests {
         assert_eq!(parse_raw_binary(&frame), crate::exchange_stubs::bytes_to_value(&frame));
         // json over the binary opcode is still parsed
         assert!(matches!(parse_raw_binary(b"{\"x\":true}"), Value::Dict(_)));
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    /// G4/A03: the first queue is hard-bounded and an overflow fails the
+    /// connection closed exactly once, with an observable count and event.
+    #[test]
+    fn bounded_queue_fails_closed_on_overflow() {
+        let url = "wss://lifecycle.test/g4-overflow";
+        let c = ensure_slot(url);
+        c.set_incoming_capacity(2);
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        c.set_event_hook(Some(Arc::new(move |event| {
+            sink.lock().unwrap().push(match event {
+                WsEvent::Opened { generation } => format!("opened:{generation}"),
+                WsEvent::Closed { generation, reason } => format!("closed:{generation}:{reason}"),
+                WsEvent::Overflow { generation, dropped, capacity } => {
+                    format!("overflow:{generation}:{dropped}:{capacity}")
+                }
+            });
+        })));
+
+        assert!(c.push_incoming(Value::Int(1)));
+        assert!(c.push_incoming(Value::Int(2)));
+        assert!(!c.push_incoming(Value::Int(3)));
+        assert_eq!(c.overflow_count(), 1);
+        assert!(c.is_closed());
+        assert_eq!(c.close_reason().as_deref(), Some("incoming queue overflow"));
+
+        // Frames after the close are dropped without inflating the counter or
+        // re-emitting the overflow event.
+        assert!(!c.push_incoming(Value::Int(4)));
+        assert_eq!(c.overflow_count(), 1);
+
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.iter().filter(|s| s.starts_with("overflow:")).count(), 1, "{seen:?}");
+        assert_eq!(seen.iter().filter(|s| s.starts_with("closed:")).count(), 1, "{seen:?}");
+        assert_eq!(c.incoming.lock().unwrap().len(), 2);
+        drop_client(url);
+    }
+
+    /// G2/A02: a connection carries a generation and a close transition that a
+    /// consumer can observe and attribute.
+    #[test]
+    fn connection_generation_and_close_are_observable() {
+        let url = "wss://lifecycle.test/g2-epoch";
+        mock_setup(url);
+        let c = get_client(url).expect("mock slot");
+        assert_eq!(c.generation(), 1);
+        assert!(!c.is_closed());
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        c.set_event_hook(Some(Arc::new(move |event| {
+            sink.lock().unwrap().push(match event {
+                WsEvent::Opened { generation } => format!("opened:{generation}"),
+                WsEvent::Closed { generation, reason } => format!("closed:{generation}:{reason}"),
+                WsEvent::Overflow { .. } => "overflow".to_string(),
+            });
+        })));
+        c.mock_close("peer closed");
+        assert!(c.is_closed());
+        assert_eq!(c.close_reason().as_deref(), Some("peer closed"));
+        assert_eq!(seen.lock().unwrap().as_slice(), &["closed:1:peer closed".to_string()]);
+        drop_client(url);
+    }
+
+    /// G2/A02: a physical reconnect after a close must land on a **higher**
+    /// epoch, not restart at 1.
+    #[test]
+    fn reconnect_keeps_the_generation_monotonic() {
+        let url = "wss://lifecycle.test/g2-reconnect";
+        mock_setup(url);
+        let first = get_client(url).expect("first slot");
+        assert_eq!(first.generation(), 1);
+        first.mock_close("peer closed");
+        assert!(first.is_closed());
+
+        mock_setup(url);
+        let second = get_client(url).expect("second slot");
+        assert_eq!(second.generation(), 2);
+        drop_client(url);
     }
 }

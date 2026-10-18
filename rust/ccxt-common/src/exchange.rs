@@ -38,6 +38,18 @@ type HmacMd5    = Hmac<Md5>;
 /// Callback type used by derived exchanges to provide their `describe()` data.
 pub type DescribeCallback = Arc<dyn Fn() -> Value + Send + Sync>;
 
+/// Pre-parse HTTP response observer.
+///
+/// Called with the response status, the request URL and method, and the
+/// **complete response body text** exactly as received, **before**
+/// `serde_json::from_str` turns it into a `Value`. Downstream consumers use it
+/// to archive the raw body and to take number lexemes from the original text
+/// instead of the `f64`-normalised `Value`.
+///
+/// `None` (the default) keeps behaviour byte-for-byte identical to before.
+pub type RawResponseHook =
+    Arc<dyn Fn(u16, &str, &str, &str) + Send + Sync>;
+
 // HTTP/JSON timing counters — accumulated by `fetch_typed`, read+reset
 // by the CLI / benchmarks via `take_http_timings()`.
 static HTTP_NANOS:  std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -70,6 +82,8 @@ pub fn take_http_timings() -> (u64, u64, u64) {
 pub struct Internals {
     pub http_client:    Option<reqwest::Client>,
     pub describe_cb:    Option<DescribeCallback>,
+    /// Optional pre-parse HTTP response observer. See [`RawResponseHook`].
+    pub raw_response_hook: Option<RawResponseHook>,
     pub last_rest_ts:   i64,
     pub headers:        HashMap<String, String>,
     /// Leaky-bucket rate-limiter state, `(tokens, last_refill_ms)`, shared and
@@ -175,6 +189,7 @@ impl Default for Internals {
         Self {
             http_client:      None,
             describe_cb:      None,
+            raw_response_hook: None,
             last_rest_ts:     0,
             headers:          HashMap::new(),
             throttle:         std::sync::Arc::new(tokio::sync::Mutex::new((0.0, 0))),
@@ -1470,6 +1485,14 @@ pub trait ExchangeRuntime: crate::exchange_generated::ExchangeBase {
             } else {
                 eprintln!("[ccxt]   response body: {text}");
             }
+        }
+        // Pre-parse observer: hands over the body text exactly as received.
+        // `text` is borrowed, so with no hook installed the cost is one
+        // `Option` check and no clone. The `Arc` is cloned and the lock
+        // released before the call, so a hook that (re)installs itself cannot
+        // deadlock.
+        if let Some(hook) = self.internals.raw_response_hook.clone() {
+            hook(status, url, method, &text);
         }
         let __json_t0 = std::time::Instant::now();
         let json = match serde_json::from_str::<serde_json::Value>(&text) {

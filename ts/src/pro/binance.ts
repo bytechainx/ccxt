@@ -794,6 +794,12 @@ export default class binance extends binanceRest {
         const [ watchOrderBookRateOption, paramsRate ] = this.handleOptionStringAndParams (params, 'watchOrderBookForSymbols', 'watchOrderBookRate', '100');
         let watchOrderBookRate: Str = watchOrderBookRateOption;
         const [ rpi, paramsRpi ] = this.handleOptionBoolAndParams (paramsRate, 'watchOrderBookForSymbols', 'rpi', false);
+        // G3: a caller-supplied snapshot closes the internal REST bootstrap. The
+        // consumer binds it to its own attempt/token, and the SDK must not issue
+        // a second request. It travels on the subscription (never in the
+        // subscribe frame), so the wire payload is unchanged.
+        const providedSnapshot = this.safeDict (paramsRpi, 'snapshot');
+        const requestParams: Dict = this.omit (paramsRpi, 'snapshot');
         if (rpi && type === 'linear') {
             name = 'rpiDepth';
             watchOrderBookRate = '500';
@@ -826,9 +832,12 @@ export default class binance extends binanceRest {
             'method': this.handleOrderBookSubscription,
             'limit': limit,
             'type': type,
-            'params': paramsRpi,
+            'params': requestParams,
         };
-        const orderbook: WsOrderBook = await this.watchMultiple (url, messageHashes, this.extend (request, paramsRpi), messageHashes, subscription);
+        if (providedSnapshot !== undefined) {
+            subscription['snapshot'] = providedSnapshot;
+        }
+        const orderbook: WsOrderBook = await this.watchMultiple (url, messageHashes, this.extend (request, requestParams), messageHashes, subscription);
         return orderbook.limit ();
     }
 
@@ -1013,7 +1022,12 @@ export default class binance extends binanceRest {
             // 3. Get a depth snapshot from https://www.binance.com/api/v1/depth?symbol=BNBBTC&limit=1000 .
             // todo: this is a synch blocking call - make it async
             // default 100, max 1000, valid limits 5, 10, 20, 50, 100, 500, 1000
-            const snapshot = await this.fetchRestOrderBookSafe (symbol, limit, params);
+            // G3: when the caller supplies the snapshot, skip the internal fetch
+            // and its retry loop entirely; the supplied attempt is authoritative.
+            let snapshot = this.safeDict (subscription, 'snapshot');
+            if (snapshot === undefined) {
+                snapshot = await this.fetchRestOrderBookSafe (symbol, limit, params);
+            }
             if (this.safeValue (this.orderbooks, symbol) === undefined) {
                 // if the orderbook is dropped before the snapshot is received
                 return;
