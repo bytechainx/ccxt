@@ -1322,6 +1322,12 @@ impl BinanceCore {
         let mut rpiparamsRpiVariable = self.handle_option_bool_and_params(paramsRate, Value::Str("watchOrderBookForSymbols".into()), Value::Str("rpi".into()), &[Value::Bool(false)]);
         let mut rpi: Value = rpiparamsRpiVariable.as_array().and_then(|__arr| __arr.get(0)).cloned().unwrap_or(Value::Null);
         let mut paramsRpi: Value = rpiparamsRpiVariable.as_array().and_then(|__arr| __arr.get(1)).cloned().unwrap_or(Value::Null);
+        // G3: a caller-supplied snapshot closes the internal REST bootstrap. The
+        // consumer binds it to its own attempt/token, and the SDK must not issue
+        // a second request. It travels on the subscription (never in the
+        // subscribe frame), so the wire payload is unchanged.
+        let mut providedSnapshot: Value = self.safe_dict_k(paramsRpi.clone(), "snapshot", &[]);
+        let mut requestParams: Value = self.omit(paramsRpi, Value::Str("snapshot".into()), &[]);
         if is_true(&rpi) && (type_var.as_str() == Some("linear")) {
             name = Value::Str("rpiDepth".into());
             watchOrderBookRate = Value::Str("500".into());
@@ -1361,10 +1367,13 @@ impl BinanceCore {
                 m.insert("method".to_string(), Value::Str("handle_order_book_subscription".into()).clone());
                 m.insert("limit".to_string(), limit.clone());
                 m.insert("type".to_string(), type_var);
-                m.insert("params".to_string(), paramsRpi.clone());
+                m.insert("params".to_string(), requestParams.clone());
             m
         });
-        let __ws_arg_3 = self.extend(request, &[paramsRpi]);
+        if (providedSnapshot != Value::Null) {
+            if let Value::Dict(__d) = &mut subscription { std::sync::Arc::make_mut(__d).insert("snapshot".into(), providedSnapshot); }
+        }
+        let __ws_arg_3 = self.extend(request, &[requestParams]);
         let mut orderbook: Value = self.watch_multiple(url, messageHashes.clone(), &[__ws_arg_3, messageHashes.clone(), subscription]).await;
         return orderbook.limit();
 
@@ -1587,11 +1596,16 @@ impl BinanceCore {
             let mut defaultLimit: Value = self.safe_integer_k(self.options.clone(), "watchOrderBookLimit", &[Value::Int(1000)]);
             let mut type_var: Option<String> = self.safe_string_k(subscription.clone(), "type", &[]).as_str().map(str::to_owned);
             let mut limit: Value = self.safe_integer_k(subscription.clone(), "limit", &[defaultLimit]);
-            let mut params: Value = self.safe_dict_k(subscription, "params", &[]);
+            let mut params: Value = self.safe_dict_k(subscription.clone(), "params", &[]);
             // 3. Get a depth snapshot from https://www.binance.com/api/v1/depth?symbol=BNBBTC&limit=1000 .
             // todo: this is a synch blocking call - make it async
             // default 100, max 1000, valid limits 5, 10, 20, 50, 100, 500, 1000
-            let mut snapshot: Value = self.fetch_rest_order_book_safe(symbol.clone(), &[limit, params]).await;
+            // G3: when the caller supplies the snapshot, skip the internal fetch
+            // and its retry loop entirely; the supplied attempt is authoritative.
+            let mut snapshot: Value = self.safe_dict_k(subscription, "snapshot", &[]);
+            if (snapshot == Value::Null) {
+                snapshot = self.fetch_rest_order_book_safe(symbol.clone(), &[limit, params]).await;
+            }
             if (self.safe_value(self.orderbooks.clone(), symbol.clone(), &[]) == Value::Null) {
                 return Value::Null;
             }
